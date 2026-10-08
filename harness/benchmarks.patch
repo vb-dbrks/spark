@@ -1,0 +1,444 @@
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/MapLookupBenchmark.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/MapLookupBenchmark.scala
+index 260f1294316..f40fce6634b 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/MapLookupBenchmark.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/MapLookupBenchmark.scala
+@@ -188,6 +188,10 @@ object MapLookupBenchmark extends SqlBasedBenchmark {
+   }
+ 
+   override def runBenchmarkSuite(mainArgs: Array[String]): Unit = {
++    if (mainArgs.headOption.contains("--investigate")) {
++      MapLookupInvestigation.run(spark, mainArgs.tail)
++      return
++    }
+     // Three sizes spanning three orders of magnitude: 10000 is well above the default
+     // threshold (hash wins clearly), 1000 is at the threshold, and 10 is well below it
+     // (hash overhead dominates -- justifies the threshold default). Upper bound is capped
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/MapLookupInvestigation.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/MapLookupInvestigation.scala
+new file mode 100644
+index 00000000000..6575b4913d7
+--- /dev/null
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/MapLookupInvestigation.scala
+@@ -0,0 +1,350 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.execution.benchmark
++
++import java.lang.management.ManagementFactory
++import java.nio.charset.StandardCharsets.UTF_8
++import java.nio.file.{Files, Path, Paths, StandardOpenOption}
++
++import scala.concurrent.duration._
++import scala.util.Random
++
++import org.apache.spark.benchmark.Benchmark
++import org.apache.spark.sql.{Column, DataFrame, Row, SparkSession}
++import org.apache.spark.sql.catalyst.InternalRow
++import org.apache.spark.sql.catalyst.expressions._
++import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, GenerateUnsafeProjection}
++import org.apache.spark.sql.catalyst.plans.SQLHelper
++import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, GenericArrayData}
++import org.apache.spark.sql.classic.ExpressionColumnNode
++import org.apache.spark.sql.functions._
++import org.apache.spark.sql.internal.SQLConf
++import org.apache.spark.sql.types._
++import org.apache.spark.unsafe.hash.Murmur3_x86_32
++
++/** Local evidence harness; production hashing is deliberately unchanged. */
++object MapLookupInvestigation extends SQLHelper {
++  val numRows: Int = 100000
++  private var evidenceDir: Path = _
++  private var reverse: Boolean = false
++  private var comparison: Boolean = false
++  def selectedModes: Seq[Mode] = if (comparison) Seq(modes.head) else modes
++  @volatile private var sink: Any = _
++
++  case class Mode(name: String, generated: Boolean, threshold: Int)
++  val modes: Seq[Mode] = Seq(
++    Mode("default", true, 1000),
++    Mode("generated-hash", true, 0),
++    Mode("generated-linear", true, Int.MaxValue),
++    Mode("interpreted-hash", false, 0),
++    Mode("interpreted-linear", false, Int.MaxValue))
++
++  def ordered[A](xs: Seq[A]): Seq[A] = if (reverse) xs.reverse else xs
++
++  def configure(spark: SparkSession, args: Array[String]): Unit = {
++    require(args.nonEmpty, "Supply an output directory and optionally reverse or pilot")
++    evidenceDir = Paths.get(args(0))
++    Files.createDirectories(evidenceDir)
++    reverse = args.contains("reverse")
++    comparison = args.contains("comparison")
++    spark.sparkContext.setLogLevel("ERROR")
++    spark.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
++    spark.conf.set(SQLConf.SHUFFLE_PARTITIONS.key, "1")
++    spark.conf.set(SQLConf.MAX_TO_STRING_FIELDS.key, "50")
++    inMode(modes.head) { () }
++    save("loaded-catalyst.txt",
++      classOf[GetMapValue].getProtectionDomain.getCodeSource.getLocation.toString)
++    val runtime = ManagementFactory.getRuntimeMXBean
++    save("environment.txt", s"${runtime.getVmName} ${runtime.getVmVersion}\n" +
++      s"${runtime.getInputArguments}\nmaxHeap=${Runtime.getRuntime.maxMemory()}\n" +
++      s"rows=$numRows\nreverse=$reverse\n${spark.conf.getAll.toSeq.sorted.mkString("\n")}")
++  }
++
++  def save(name: String, content: String): Unit = {
++    Files.write(evidenceDir.resolve(name), content.getBytes(UTF_8))
++  }
++
++  def inMode[T](mode: Mode)(f: => T): T = {
++    if (mode.name == "default") {
++      require(SQLConf.get.getConf(SQLConf.MAP_LOOKUP_HASH_THRESHOLD) == mode.threshold)
++      require(SQLConf.get.getConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED))
++      require(SQLConf.get.getConf(SQLConf.CODEGEN_FACTORY_MODE).toString == "FALLBACK")
++      return f
++    }
++    withSQLConf(
++      SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> mode.generated.toString,
++      SQLConf.CODEGEN_FACTORY_MODE.key -> (if (mode.generated) "CODEGEN_ONLY" else "NO_CODEGEN"),
++      SQLConf.MAP_LOOKUP_HASH_THRESHOLD.key -> mode.threshold.toString)(f)
++  }
++
++  def measure(id: String, rows: Long)(f: => Unit): Unit = {
++    val benchmark = new Benchmark(id, rows, minNumIters = 5,
++      warmupTime = 2.seconds, minTime = Duration.Zero, outputPerIteration = true)
++    benchmark.addCase(id, numIters = 5) { iteration =>
++      val start = System.nanoTime()
++      f
++      val elapsed = System.nanoTime() - start
++      if (iteration >= 0) {
++        val line = s"$id,$iteration,$elapsed\n"
++        Files.write(evidenceDir.resolve("samples.csv"), line.getBytes(UTF_8),
++          StandardOpenOption.CREATE, StandardOpenOption.APPEND)
++      }
++    }
++    benchmark.run()
++  }
++
++  def capture(id: String, df: DataFrame, expectHash: Boolean, generated: Boolean): Unit = {
++    val qe = df.queryExecution
++    val lookups = qe.optimizedPlan.flatMap(_.expressions.flatMap(_.collect {
++      case e: GetMapValue => (e.child, e.key)
++      case e: ElementAt if e.left.dataType.isInstanceOf[MapType] => (e.left, e.right)
++    }))
++    require(lookups.nonEmpty, s"Lookup optimized away for $id")
++    save(s"$id-types.txt", lookups.map { case (map, key) =>
++      s"map=${map.dataType}, foldable=${map.foldable}, key=${key.dataType}, " +
++        s"keyFoldable=${key.foldable}"
++    }.mkString("\n"))
++    require(lookups.forall { case (_, key) => !key.foldable }, "Keys must be runtime inputs")
++    val code = qe.debug.codegenToSeq().map(_._2).mkString("\n")
++    save(s"$id-plan.txt", qe.toString)
++    save(s"$id-code.java", code)
++    if (generated) {
++      require(code.contains("mapLookupBuckets") == expectHash,
++        s"Unexpected lookup strategy for $id")
++    }
++  }
++
++  private def convert(value: Double, dataType: DataType): Any = dataType match {
++    case DoubleType => value
++    case FloatType => value.toFloat
++    case IntegerType => value.toInt
++  }
++
++  private def keys(size: Int, distribution: String, dataType: DataType): Array[Any] = {
++    val random = new Random(52878)
++    val values = (0 until size).map { i =>
++      val value = distribution match {
++        case "dense" => i.toDouble
++        case "sparse" => i * 17.0 + 1.0
++        case "random" =>
++          if (dataType == IntegerType) random.nextInt(Int.MaxValue).toDouble
++          else random.nextDouble() * 1000000.0
++      }
++      convert(value, dataType)
++    }.toArray
++    // Float rounding can collapse random keys. Redraw deterministically until unique.
++    val unique = scala.collection.mutable.LinkedHashSet.empty[Any]
++    unique ++= values
++    while (unique.size < size) {
++      unique += convert(random.nextDouble() * 1000000.0, dataType)
++    }
++    unique.toArray
++  }
++
++  private def literal(ks: Array[Any], dataType: DataType): Literal = {
++    val map = new ArrayBasedMapData(new GenericArrayData(ks),
++      new GenericArrayData(ks.indices.map(_.toLong).toArray))
++    Literal.create(map, MapType(dataType, LongType, valueContainsNull = false))
++  }
++
++  private def runCase(
++      spark: SparkSession,
++      size: Int,
++      distribution: String,
++      dataType: DataType,
++      hitPercent: Int,
++      selectedModes: Seq[Mode],
++      fresh: Boolean): Unit = {
++    val ks = keys(size, distribution, dataType)
++    val map = literal(ks, dataType)
++    val hitCount = numRows * hitPercent / 100
++    val lookupRows = (0 until numRows).map { i =>
++      Row(if (i < hitCount) ks(i % size) else convert(-1.0 - i % size, dataType))
++    }
++    val schema = StructType(Seq(StructField("key", dataType, nullable = false)))
++    val input = spark.createDataFrame(spark.sparkContext.parallelize(lookupRows, 1), schema)
++      .cache()
++    require(input.count() == numRows)
++    val expected = (0 until hitCount).map(i => (i % size).toLong).sum - (numRows - hitCount)
++    try {
++      ordered(selectedModes).foreach { mode =>
++        inMode(mode) {
++          val id = s"sql-${dataType.typeName}-$distribution-$size-$hitPercent-${mode.name}"
++          def query(): DataFrame = {
++            val m = new Column(ExpressionColumnNode(map))
++            input.select(m.getItem(col("key")).as("value"))
++              .agg(sum(coalesce(col("value"), lit(-1L))).as("checksum"))
++          }
++          val prepared = query()
++          save(s"$id-checksum.txt", s"expected=$expected,rows=$numRows")
++          def consume(df: DataFrame): Unit = {
++            val result = df.collect().head.getLong(0)
++            require(result == expected, s"$id: $result != $expected")
++            sink = result
++          }
++          consume(prepared)
++          capture(id, prepared, size >= mode.threshold, mode.generated)
++          measure(s"$id-repeat", numRows) { consume(prepared) }
++          if (fresh) {
++            measure(s"$id-fresh", numRows) { consume(query()) }
++          }
++        }
++      }
++    } finally {
++      input.unpersist(blocking = true)
++    }
++  }
++
++  private def bucketEvidence(map: Literal, dataType: DataType, id: String): Unit = {
++    val ctx = new CodegenContext
++    val expression = GetMapValue(map, BoundReference(0, dataType, nullable = false))
++    val code = expression.genCode(ctx).code.toString
++    val mixed = code.contains("Murmur3_x86_32")
++    val buckets = ctx.references.collectFirst { case a: Array[Int] => a }.get
++    val data = map.value.asInstanceOf[ArrayBasedMapData]
++    val mask = buckets.length - 1
++    val starts = scala.collection.mutable.Set.empty[Int]
++    var probes = 0L
++    var maximum = 0
++    for (i <- 0 until data.numElements()) {
++      val hash = dataType match {
++        case DoubleType =>
++          val value = data.keyArray.getDouble(i)
++          val bits = java.lang.Double.doubleToLongBits(if (mixed && value == 0.0d) 0.0d else value)
++          if (mixed) Murmur3_x86_32.hashLong(bits, 42) else (bits ^ (bits >>> 32)).toInt
++        case FloatType =>
++          val value = data.keyArray.getFloat(i)
++          val bits = java.lang.Float.floatToIntBits(if (mixed && value == 0.0f) 0.0f else value)
++          if (mixed) Murmur3_x86_32.hashInt(bits, 42) else bits
++        case IntegerType => data.keyArray.getInt(i)
++      }
++      var position = hash & mask
++      starts += position
++      var length = 1
++      while (buckets(position) != i) {
++        require(buckets(position) != -1, "Diagnostic hash differs from production")
++        position = (position + 1) & mask
++        length += 1
++      }
++      probes += length
++      maximum = math.max(maximum, length)
++    }
++    save(s"$id-buckets.txt", s"entries=${data.numElements()},capacity=${buckets.length}," +
++      s"distinctStartBuckets=${starts.size},totalSuccessfulProbes=$probes,maxProbes=$maximum")
++  }
++
++  private def initialization(): Unit = {
++    for {
++      size <- ordered(Seq(1000, 10000))
++      dataType <- ordered(Seq(DoubleType, FloatType, IntegerType))
++      distribution <- ordered(Seq("dense", "sparse", "random"))
++      mode <- ordered(Seq(modes(1), modes(2)))
++    } {
++      val map = literal(keys(size, distribution, dataType), dataType)
++      inMode(mode) {
++        val id = s"init-${dataType.typeName}-$distribution-$size-${mode.name}"
++        if (mode.threshold == 0) bucketEvidence(map, dataType, id)
++        // A fresh expression forces the actual executor, Java index and codegen buckets to build.
++        measure(id, size) {
++          val expression = GetMapValue(map, BoundReference(0, dataType, nullable = false))
++          sink = expression.eval(InternalRow(convert(-1.0, dataType)))
++        }
++      }
++    }
++  }
++
++  private def specialValues(): Unit = {
++    val lines = scala.collection.mutable.ArrayBuffer.empty[String]
++    for (dataType <- Seq(DoubleType, FloatType)) {
++      val ks = Array[Any](convert(0.0, dataType), convert(Double.NaN, dataType),
++        convert(Double.PositiveInfinity, dataType), convert(Double.NegativeInfinity, dataType))
++      val mapData = new ArrayBasedMapData(new GenericArrayData(ks),
++        new GenericArrayData(Array[Any](10L, 20L, 30L, null)))
++      val map = Literal.create(mapData, MapType(dataType, LongType))
++      val queries = Seq(0.0, -0.0, Double.NaN, Double.PositiveInfinity,
++        Double.NegativeInfinity, 1.0)
++      for (mode <- modes.tail; function <- Seq("GetMapValue", "ElementAt")) {
++        inMode(mode) {
++          val key = BoundReference(0, dataType, nullable = true)
++          val expression = if (function == "GetMapValue") GetMapValue(map, key)
++            else ElementAt(map, key)
++          val projection = if (mode.generated) {
++            Some(GenerateUnsafeProjection.generate(Seq(expression)))
++          } else None
++          (queries.map(convert(_, dataType)) :+ null).foreach { value =>
++            val row = InternalRow(value)
++            val result = projection.map { p =>
++              val output = p(row)
++              if (output.isNullAt(0)) null else output.getLong(0)
++            }.getOrElse(expression.eval(row))
++            lines += s"${dataType.typeName},${mode.name},$function,$value,$result"
++          }
++        }
++      }
++    }
++    save("special-values.csv", lines.mkString("\n"))
++  }
++
++  private def nonFoldable(spark: SparkSession): Unit = {
++    val size = 1000
++    val map = (0 until size).map(i => i.toDouble -> i.toLong).toMap
++    // Keep this control small: unlike the foldable case it carries a map in every input row.
++    val rows = (0 until 1000).map(i => Row(map, (i % size).toDouble))
++    val schema = StructType(Seq(StructField("m", MapType(DoubleType, LongType)),
++      StructField("key", DoubleType)))
++    val input = spark.createDataFrame(spark.sparkContext.parallelize(rows, 1), schema).cache()
++    input.count()
++    try {
++      ordered(selectedModes).foreach { mode =>
++        inMode(mode) {
++          val df = input.select(col("m").getItem(col("key")).as("value"))
++            .agg(sum(col("value")))
++          val id = s"nonfoldable-${mode.name}"
++          capture(id, df, expectHash = false, generated = mode.generated)
++          measure(id, 1000) { require(df.collect().head.getLong(0) == 499500L) }
++        }
++      }
++    } finally {
++      input.unpersist(blocking = true)
++    }
++  }
++
++  def run(spark: SparkSession, args: Array[String]): Unit = {
++    configure(spark, args)
++    specialValues()
++    val types = Seq(DoubleType, FloatType, IntegerType)
++    if (args.contains("pilot")) {
++      types.foreach(runCase(spark, 1000, "dense", _, 100, selectedModes, fresh = true))
++    } else {
++      initialization()
++      for {
++        size <- ordered(Seq(1000, 10000))
++        dataType <- ordered(types)
++        distribution <- ordered(Seq("dense", "sparse", "random"))
++        hits <- ordered(Seq(100, 50, 0))
++      } {
++        runCase(spark, size, distribution, dataType, hits, selectedModes,
++          fresh = hits == 100 && distribution == "dense")
++      }
++      for (size <- ordered(Seq(10, 999, 1001)); dataType <- ordered(types)) {
++        runCase(spark, size, "dense", dataType, 100, Seq(modes.head), fresh = true)
++      }
++      nonFoldable(spark)
++    }
++  }
++}
+diff --git a/mllib/src/test/scala/org/apache/spark/ml/feature/TargetEncoderMapLookupBenchmark.scala b/mllib/src/test/scala/org/apache/spark/ml/feature/TargetEncoderMapLookupBenchmark.scala
+new file mode 100644
+index 00000000000..2eb6a4f8b0c
+--- /dev/null
++++ b/mllib/src/test/scala/org/apache/spark/ml/feature/TargetEncoderMapLookupBenchmark.scala
+@@ -0,0 +1,67 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.ml.feature
++
++import org.apache.spark.sql.Row
++import org.apache.spark.sql.execution.benchmark.{MapLookupInvestigation, SqlBasedBenchmark}
++import org.apache.spark.sql.functions._
++import org.apache.spark.sql.types._
++
++/** Measures transform only; fit and input preparation are outside the timed sections. */
++object TargetEncoderMapLookupBenchmark extends SqlBasedBenchmark {
++  override def runBenchmarkSuite(args: Array[String]): Unit = {
++    val harness = MapLookupInvestigation
++    harness.configure(spark, args)
++    val schema = StructType(Seq(StructField("category", DoubleType, nullable = false),
++      StructField("label", DoubleType, nullable = false)))
++    harness.ordered(Seq(1000, 10000)).foreach { size =>
++      val training = (0 until size).flatMap { i =>
++        Seq.fill(5)(Row(i.toDouble, (i % 7).toDouble))
++      }
++      val train = spark.createDataFrame(spark.sparkContext.parallelize(training, 1), schema)
++      val start = System.nanoTime()
++      val model = new TargetEncoder().setInputCols(Array("category"))
++        .setOutputCols(Array("encoded")).setLabelCol("label")
++        .setTargetType("continuous").setSmoothing(0.0).fit(train)
++      harness.save(s"fit-$size.txt", s"elapsedNs=${System.nanoTime() - start}")
++      val input = spark.range(harness.numRows).select((col("id") % size)
++        .cast(DoubleType).as("category")).cache()
++      input.count()
++      val expected = (0 until harness.numRows).map(i => ((i % size) % 7).toDouble).sum
++      try {
++        harness.ordered(harness.selectedModes).foreach { mode =>
++          harness.inMode(mode) {
++            val id = s"target-encoder-$size-${mode.name}"
++            def query() = model.transform(input).agg(sum(col("encoded")))
++            val prepared = query()
++            require(prepared.collect().head.getDouble(0) == expected)
++            harness.capture(id, prepared, size >= mode.threshold, mode.generated)
++            harness.measure(s"$id-repeat", harness.numRows) {
++              require(prepared.collect().head.getDouble(0) == expected)
++            }
++            harness.measure(s"$id-fresh", harness.numRows) {
++              require(query().collect().head.getDouble(0) == expected)
++            }
++          }
++        }
++      } finally {
++        input.unpersist(blocking = true)
++      }
++    }
++  }
++}

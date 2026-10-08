@@ -1,0 +1,73 @@
+{
+  "baseline": "0c14861e323174452d42ffb7947d1c1158c39286",
+  "artifacts": {
+    "baseline": {
+      "variant": "baseline",
+      "sha256": "9cb200fee26ae8de6f2fc8dee2725993f5dd9b6ec901fa8a696a7751b7c59ea7",
+      "source_sha256": "81fa0fe1c7b5474d5f8c6a746b2912e40a10dda05f964fef6162a7ee21825815",
+      "baseline": "0c14861e323174452d42ffb7947d1c1158c39286",
+      "created": "2026-10-07T15:18:11.443785+00:00"
+    },
+    "candidate": {
+      "variant": "candidate",
+      "sha256": "10d5fc138feba51fc164a8ebfd2e6c13ff436c1e1d5d7a59cc147d61c0854a6d",
+      "source_sha256": "572db0567dda21d28d785c322776ffc734fc32a201e7497248d7ce09a1193e87",
+      "baseline": "0c14861e323174452d42ffb7947d1c1158c39286",
+      "created": "2026-10-07T15:21:55.998236+00:00"
+    }
+  },
+  "hardware": {
+    "cpu": "Apple M3 Pro",
+    "memory_gib": 36,
+    "os": "macOS 26.6.2",
+    "jdk": "Temurin 21.0.5+11-LTS arm64",
+    "sbt": "1.12.13",
+    "benchmark_heap_gib": 4
+  },
+  "runtime": {
+    "master": "local[1]",
+    "adaptive_execution": false,
+    "shuffle_partitions": 1,
+    "map_lookup_threshold": 1000,
+    "whole_stage_codegen": true,
+    "codegen_factory_mode": "FALLBACK",
+    "seed": 52878
+  },
+  "target_encoder": {
+    "rows": 100000,
+    "warmup_seconds": 2,
+    "samples_per_case_per_jvm": 5,
+    "fresh_jvms_per_variant": 3,
+    "raw_samples": 120,
+    "training_rows_per_category": 5,
+    "target": "category % 7",
+    "smoothing": 0,
+    "input": "Cached Range; training and data preparation excluded"
+  },
+  "range": {
+    "rows": 1000000,
+    "warmup_seconds": 5,
+    "samples_per_case_per_jvm": 5,
+    "fresh_jvms_per_variant": 3,
+    "raw_samples": 330,
+    "cases": [
+      "float-dense-1000",
+      "double-dense-1000",
+      "float-random-10000",
+      "double-random-10000",
+      "float-sparse-10000",
+      "double-sparse-10000",
+      "integer-dense-10000",
+      "integer-random-10000",
+      "float-random-10000-miss",
+      "double-random-10000-miss",
+      "integer-random-10000-miss"
+    ],
+    "input": "Cached Range projection into typed literal key arrays; preparation excluded",
+    "missing_keys": "Negative integral -1 through -10000; checked absent after conversion"
+  },
+  "order": "Baseline then candidate in rounds 1 and 3; candidate then baseline in round 2. Case order reversed in round 2.",
+  "measurement": "Elapsed System.nanoTime around query action and checked aggregate; CSV append excluded. No samples discarded.",
+  "public_package": "Selected complete TargetEncoder and final Range experiments; earlier RDD-backed SQL experiments and optional workspace artifacts are not included.",
+  "pr_source_commit": "c6be3c197c7ef4d3d760593e29f7be16a9602534"
+}
